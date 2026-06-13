@@ -1,0 +1,458 @@
+--[[
+    RobloxTelegramNotifier.lua
+    Place this Script inside ServerScriptService.
+
+    IMPORTANT: Replace TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID with your own values.
+    This script is intended for personal use in a Roblox experience you own
+    or have permission to modify.
+--]]
+
+-- ============================================================
+-- CONFIGURATION
+-- ============================================================
+
+local TELEGRAM_BOT_TOKEN = "8686310272:AAFm6En6EdD_Q6bMxafSWdnOzg5pHOyKyvo"
+local TELEGRAM_CHAT_ID   = "8686310272"
+
+-- The name of the IntValue/NumberValue holding the player's money.
+-- Adjust this path to match your game's data structure.
+local MONEY_VALUE_NAME = "Money"         -- e.g. leaderstats.Money
+
+-- Name of the Folder/Model that contains inventory values (if any).
+-- Set to nil to skip inventory tracking.
+local INVENTORY_FOLDER_NAME = "Inventory"  -- e.g. leaderstats.Inventory
+
+-- How many seconds to wait before retrying a failed Telegram request.
+local RETRY_DELAY    = 3
+local MAX_RETRIES    = 3
+
+-- Minimum money delta that counts as a "change" (avoids float noise).
+local MONEY_EPSILON  = 0.001
+
+-- ============================================================
+-- SERVICES
+-- ============================================================
+
+local Players      = game:GetService("Players")
+local HttpService  = game:GetService("HttpService")
+local RunService   = game:GetService("RunService")
+
+-- ============================================================
+-- TELEGRAM HELPERS
+-- ============================================================
+
+local function getTimestamp()
+    -- Returns a human-readable UTC-like timestamp using os.time().
+    -- Roblox servers run in UTC.
+    local t = os.date("!*t", os.time())
+    return string.format("%04d-%02d-%02d %02d:%02d:%02d UTC",
+        t.year, t.month, t.day, t.hour, t.min, t.sec)
+end
+
+local function sendTelegram(text, retryCount)
+    retryCount = retryCount or 0
+
+    local url = string.format(
+        "https://api.telegram.org/bot%s/sendMessage",
+        TELEGRAM_BOT_TOKEN
+    )
+
+    local payload = HttpService:JSONEncode({
+        chat_id    = TELEGRAM_CHAT_ID,
+        text       = text,
+        parse_mode = "HTML",
+    })
+
+    local success, result = pcall(function()
+        return HttpService:PostAsync(url, payload, Enum.HttpContentType.ApplicationJson, false)
+    end)
+
+    if not success then
+        warn("[TelegramNotifier] Request failed:", result)
+        if retryCount < MAX_RETRIES then
+            task.wait(RETRY_DELAY)
+            sendTelegram(text, retryCount + 1)
+        else
+            warn("[TelegramNotifier] Max retries reached. Dropping message.")
+        end
+    end
+end
+
+-- ============================================================
+-- PER-PLAYER STATE
+-- ============================================================
+
+-- playerState[userId] = {
+--   name          = string,
+--   money         = number,
+--   inventory     = { [itemName] = quantity },
+--   session       = {
+--     purchases   = { [itemName] = { count, totalSpent } },
+--     totalSpent  = number,
+--   },
+--   connections   = { RBXScriptConnection, ... },
+--   lastMsgKey    = string,   -- dedup key for money messages
+-- }
+
+local playerState = {}
+
+-- ============================================================
+-- DEDUP HELPER
+-- ============================================================
+
+-- Prevents sending the same notification twice (e.g., rapid value fires).
+local function isDuplicate(state, key)
+    if state.lastMsgKey == key then
+        return true
+    end
+    state.lastMsgKey = key
+    return false
+end
+
+-- ============================================================
+-- SUMMARY BUILDER
+-- ============================================================
+
+local function buildSummary(state)
+    local lines = {}
+    table.insert(lines, "<b>📊 Session Summary — " .. state.name .. "</b>")
+    table.insert(lines, "")
+
+    if next(state.session.purchases) == nil then
+        table.insert(lines, "No purchases recorded yet.")
+    else
+        table.insert(lines, "<b>Items purchased:</b>")
+        for itemName, data in pairs(state.session.purchases) do
+            table.insert(lines, string.format(
+                "  • %s — %dx (spent: %g)",
+                itemName, data.count, data.totalSpent
+            ))
+        end
+        table.insert(lines, "")
+        table.insert(lines, string.format(
+            "<b>Total spent this session:</b> %g",
+            state.session.totalSpent
+        ))
+    end
+
+    table.insert(lines, string.format(
+        "<b>Current balance:</b> %g",
+        state.money
+    ))
+    table.insert(lines, "")
+    table.insert(lines, "<i>" .. getTimestamp() .. "</i>")
+
+    return table.concat(lines, "\n")
+end
+
+-- ============================================================
+-- MONEY CHANGE HANDLER
+-- ============================================================
+
+local function onMoneyChanged(state, newValue)
+    local prev   = state.money
+    local delta  = newValue - prev
+
+    -- Ignore noise
+    if math.abs(delta) < MONEY_EPSILON then
+        return
+    end
+
+    -- Dedup by rounding to avoid float jitter
+    local key = string.format("money_%.4f_%.4f", prev, newValue)
+    if isDuplicate(state, key) then
+        return
+    end
+
+    state.money = newValue
+
+    local actionType
+    if delta < 0 then
+        actionType = "💸 Purchase / Loss"
+        -- Record as a spending event (no item name here — item tracker handles named items)
+        state.session.totalSpent = state.session.totalSpent + math.abs(delta)
+    else
+        actionType = "💰 Gain"
+    end
+
+    local sign = delta >= 0 and "+" or ""
+
+    local msg = table.concat({
+        string.format("<b>%s</b>", actionType),
+        "",
+        string.format("👤 <b>Player:</b> %s", state.name),
+        string.format("💵 <b>Previous balance:</b> %g", prev),
+        string.format("💵 <b>Current balance:</b>  %g", newValue),
+        string.format("🔄 <b>Change:</b> %s%g", sign, delta),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(msg)
+
+    -- Always follow up with updated summary
+    task.delay(0.5, function()
+        sendTelegram(buildSummary(state))
+    end)
+end
+
+-- ============================================================
+-- INVENTORY CHANGE HANDLER
+-- ============================================================
+
+local function onItemChanged(state, itemName, newQty)
+    local prevQty = state.inventory[itemName] or 0
+    local delta   = newQty - prevQty
+
+    if delta == 0 then return end
+
+    local key = string.format("item_%s_%d_%d", itemName, prevQty, newQty)
+    if isDuplicate(state, key) then
+        return
+    end
+
+    state.inventory[itemName] = newQty
+
+    local actionType, emoji
+    if delta > 0 then
+        actionType = "Gained / Received"
+        emoji      = "📦"
+    else
+        actionType = "Used / Lost"
+        emoji      = "📤"
+    end
+
+    local sign = delta >= 0 and "+" or ""
+
+    local msg = table.concat({
+        string.format("<b>%s Item Event</b>", emoji),
+        "",
+        string.format("👤 <b>Player:</b>   %s",       state.name),
+        string.format("📌 <b>Action:</b>    %s",       actionType),
+        string.format("🎒 <b>Item:</b>      %s",       itemName),
+        string.format("🔢 <b>Quantity:</b>  %s%d",     sign, delta),
+        string.format("📊 <b>Previous:</b>  %d",       prevQty),
+        string.format("📊 <b>Current:</b>   %d",       newQty),
+        string.format("💵 <b>Balance:</b>   %g",       state.money),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(msg)
+end
+
+-- ============================================================
+-- PURCHASE HANDLER (fired when money goes down AND an item goes up)
+-- ============================================================
+
+-- Called explicitly when we can correlate a money loss with an item gain.
+local function recordPurchase(state, itemName, qty, cost)
+    if cost == nil or cost <= 0 then return end
+
+    -- Update session summary
+    if not state.session.purchases[itemName] then
+        state.session.purchases[itemName] = { count = 0, totalSpent = 0 }
+    end
+    local rec = state.session.purchases[itemName]
+    rec.count       = rec.count + qty
+    rec.totalSpent  = rec.totalSpent + cost
+
+    local prev    = state.money + cost  -- money before the deduction
+    local current = state.money
+
+    local msg = table.concat({
+        "<b>🛒 Purchase Detected</b>",
+        "",
+        string.format("👤 <b>Player:</b>       %s",  state.name),
+        string.format("📌 <b>Action:</b>        Purchase"),
+        string.format("🎒 <b>Item:</b>          %s",  itemName),
+        string.format("🔢 <b>Quantity:</b>      %d",  qty),
+        string.format("💸 <b>Cost:</b>          -%g", cost),
+        string.format("💵 <b>Prev balance:</b>  %g",  prev),
+        string.format("💵 <b>New balance:</b>   %g",  current),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(msg)
+
+    task.delay(0.5, function()
+        sendTelegram(buildSummary(state))
+    end)
+end
+
+-- ============================================================
+-- WATCH A SINGLE INVENTORY VALUE
+-- ============================================================
+
+local function watchInventoryValue(state, valueObj)
+    local itemName = valueObj.Name
+
+    -- Record initial quantity
+    state.inventory[itemName] = valueObj.Value
+
+    local conn = valueObj.Changed:Connect(function(newQty)
+        onItemChanged(state, itemName, newQty)
+    end)
+
+    table.insert(state.connections, conn)
+end
+
+-- ============================================================
+-- WATCH INVENTORY FOLDER (observes current + future children)
+-- ============================================================
+
+local function watchInventoryFolder(state, folder)
+    -- Existing items
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:IsA("NumberValue") or child:IsA("IntValue") then
+            watchInventoryValue(state, child)
+        end
+    end
+
+    -- Future items added at runtime
+    local addedConn = folder.ChildAdded:Connect(function(child)
+        if child:IsA("NumberValue") or child:IsA("IntValue") then
+            -- Small wait to ensure the object is fully ready
+            task.wait(0.05)
+            watchInventoryValue(state, child)
+        end
+    end)
+
+    table.insert(state.connections, addedConn)
+end
+
+-- ============================================================
+-- PLAYER SETUP
+-- ============================================================
+
+local function setupPlayer(player)
+    -- Wait for character / leaderstats to load
+    local leaderstats = player:WaitForChild("leaderstats", 10)
+    if not leaderstats then
+        warn("[TelegramNotifier] No leaderstats found for", player.Name)
+        return
+    end
+
+    local moneyValue = leaderstats:WaitForChild(MONEY_VALUE_NAME, 10)
+    if not moneyValue then
+        warn("[TelegramNotifier] Money value not found for", player.Name)
+        return
+    end
+
+    local state = {
+        name        = player.Name,
+        money       = moneyValue.Value,
+        inventory   = {},
+        session     = {
+            purchases  = {},
+            totalSpent = 0,
+        },
+        connections = {},
+        lastMsgKey  = "",
+    }
+
+    playerState[player.UserId] = state
+
+    -- Watch money
+    local moneyConn = moneyValue.Changed:Connect(function(newValue)
+        onMoneyChanged(state, newValue)
+    end)
+    table.insert(state.connections, moneyConn)
+
+    -- Watch inventory folder if configured
+    if INVENTORY_FOLDER_NAME then
+        local invFolder = leaderstats:FindFirstChild(INVENTORY_FOLDER_NAME)
+        if invFolder then
+            watchInventoryFolder(state, invFolder)
+        else
+            -- Try waiting briefly in case it loads after leaderstats
+            task.delay(2, function()
+                invFolder = leaderstats:FindFirstChild(INVENTORY_FOLDER_NAME)
+                if invFolder then
+                    watchInventoryFolder(state, invFolder)
+                end
+            end)
+        end
+    end
+
+    -- Send join notification
+    local joinMsg = table.concat({
+        "<b>🟢 Player Joined</b>",
+        "",
+        string.format("👤 <b>Player:</b>  %s",  player.Name),
+        string.format("💵 <b>Balance:</b>  %g",  state.money),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+    sendTelegram(joinMsg)
+end
+
+-- ============================================================
+-- PLAYER CLEANUP
+-- ============================================================
+
+local function cleanupPlayer(player)
+    local state = playerState[player.UserId]
+    if not state then return end
+
+    -- Disconnect all listeners
+    for _, conn in ipairs(state.connections) do
+        conn:Disconnect()
+    end
+
+    -- Send leave notification with final summary
+    local leaveMsg = table.concat({
+        "<b>🔴 Player Left</b>",
+        "",
+        string.format("👤 <b>Player:</b>  %s",  state.name),
+        string.format("💵 <b>Balance:</b>  %g",  state.money),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(leaveMsg)
+    sendTelegram(buildSummary(state))
+
+    playerState[player.UserId] = nil
+end
+
+-- ============================================================
+-- MAIN ENTRY POINT
+-- ============================================================
+
+-- Handle players already in the server (Studio testing)
+for _, player in ipairs(Players:GetPlayers()) do
+    task.spawn(setupPlayer, player)
+end
+
+Players.PlayerAdded:Connect(function(player)
+    task.spawn(setupPlayer, player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    task.spawn(cleanupPlayer, player)
+end)
+
+-- ============================================================
+-- PUBLIC API — call this from other scripts to record purchases
+-- ============================================================
+-- Example from another Script:
+--   local Notifier = require(ServerScriptService.RobloxTelegramNotifier)
+--   Notifier.recordPurchase(player, "Watering Can", 1, 50)
+--
+-- (Only works if this file is a ModuleScript; swap Script → ModuleScript
+--  and uncomment the return block below.)
+
+--[[
+return {
+    recordPurchase = function(player, itemName, qty, cost)
+        local state = playerState[player.UserId]
+        if state then
+            recordPurchase(state, itemName, qty, cost)
+        end
+    end
+}
+--]]
+
+print("[TelegramNotifier] Loaded and watching players.")
