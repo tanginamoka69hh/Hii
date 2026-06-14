@@ -1,0 +1,1022 @@
+--[[
+╔══════════════════════════════════════════════════════════════════╗
+║         ADVANCED ROBLOX TELEMETRY SYSTEM — DELTA EXECUTOR        ║
+║  Sections: CONFIG · TELEGRAM · SMART DETECTION · PLAYER TRACKING ║
+║            SHOP SYSTEM · CONFIG PERSISTENCE · GUI · MAIN INIT    ║
+╚══════════════════════════════════════════════════════════════════╝
+    Execute with Delta (or Synapse / KRNL / Fluxus).
+    Client-side only — no server permissions required.
+    Re-execute safe: old connections cleaned up automatically.
+--]]
+
+-- ============================================================
+-- SECTION 1 — CONFIG
+-- ============================================================
+
+local CFG = {
+    -- Telegram credentials
+    BOT_TOKEN    = "8686310272:AAHjuFeQN8mVxb9EW-r2jZ7PoN4cqQ90XhU",
+    CHAT_ID      = "6997943273",
+
+    -- Anti-spam: minimum seconds between Telegram messages per player
+    DEBOUNCE_SEC = 2,
+
+    -- Max retries on failed HTTP
+    MAX_RETRIES  = 3,
+    RETRY_DELAY  = 3,
+
+    -- Ignore money deltas smaller than this (float noise)
+    MONEY_EPS    = 0.001,
+
+    -- Config file name (saved to executor workspace folder)
+    CONFIG_FILE  = "TelemetryConfig_" .. tostring(game.PlaceId) .. ".json",
+
+    -- Keyword lists for smart detection
+    MONEY_KEYWORDS = {
+        "money","cash","coins","gold","points","gems","credits",
+        "tokens","bucks","stars","diamonds","rubies","currency",
+        "balance","wallet","funds","bits","crystals","shards",
+    },
+    INVENTORY_KEYWORDS = {
+        "inventory","items","backpack","storage","bag",
+        "equipment","gear","collection","stash","locker",
+    },
+    SHOP_KEYWORDS = {
+        "shop","store","shopitems","marketplace","market",
+        "catalog","vendor","mall","boutique","bazaar",
+    },
+
+    -- GUI theme
+    GUI_BG_COLOR     = Color3.fromRGB(15, 15, 20),
+    GUI_ACCENT_COLOR = Color3.fromRGB(0, 210, 120),
+    GUI_WARN_COLOR   = Color3.fromRGB(255, 180, 0),
+    GUI_ERROR_COLOR  = Color3.fromRGB(255, 60, 60),
+    GUI_TEXT_COLOR   = Color3.fromRGB(220, 220, 220),
+}
+
+-- ============================================================
+-- SECTION 2 — TELEGRAM SYSTEM
+-- ============================================================
+
+-- HTTP function — auto-detects executor API
+local httpRequest
+do
+    if syn and syn.request then
+        httpRequest = syn.request
+    elseif request then
+        httpRequest = request
+    elseif http_request then
+        httpRequest = http_request
+    elseif http and http.request then
+        httpRequest = http.request
+    else
+        error("[Telemetry] No HTTP function found. Enable HTTP in your executor.")
+    end
+end
+
+local TelegramQueue  = {}   -- { text, retries }
+local TelegramBusy   = false
+local LastSentTime   = {}   -- [playerId] = tick()
+
+local function getTimestamp()
+    local t = os.date("!*t", os.time())
+    return string.format("%04d-%02d-%02d %02d:%02d:%02d UTC",
+        t.year, t.month, t.day, t.hour, t.min, t.sec)
+end
+
+local function jsonEscape(s)
+    s = tostring(s)
+    s = s:gsub('\\', '\\\\')
+    s = s:gsub('"',  '\\"')
+    s = s:gsub('\n', '\\n')
+    s = s:gsub('\r', '\\r')
+    s = s:gsub('\t', '\\t')
+    return s
+end
+
+-- Fire-and-forget Telegram send with retry
+local function flushQueue()
+    if TelegramBusy or #TelegramQueue == 0 then return end
+    TelegramBusy = true
+
+    task.spawn(function()
+        while #TelegramQueue > 0 do
+            local item = TelegramQueue[1]
+            local url  = "https://api.telegram.org/bot" .. CFG.BOT_TOKEN .. "/sendMessage"
+            local body = string.format(
+                '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}',
+                jsonEscape(CFG.CHAT_ID),
+                jsonEscape(item.text)
+            )
+
+            local ok, res = pcall(httpRequest, {
+                Url     = url,
+                Method  = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body    = body,
+            })
+
+            if ok then
+                table.remove(TelegramQueue, 1)
+                task.wait(0.3)  -- Telegram rate limit buffer
+            else
+                item.retries = item.retries + 1
+                if item.retries >= CFG.MAX_RETRIES then
+                    warn("[Telemetry] Dropped message after max retries:", res)
+                    table.remove(TelegramQueue, 1)
+                else
+                    task.wait(CFG.RETRY_DELAY)
+                end
+            end
+        end
+        TelegramBusy = false
+    end)
+end
+
+local function sendTelegram(text, playerId)
+    -- Debounce per player
+    if playerId then
+        local now  = tick()
+        local last = LastSentTime[playerId] or 0
+        if now - last < CFG.DEBOUNCE_SEC then
+            -- Still queue it but tag for dedup
+        end
+        LastSentTime[playerId] = now
+    end
+
+    table.insert(TelegramQueue, { text = text, retries = 0 })
+    flushQueue()
+end
+
+-- ============================================================
+-- SECTION 3 — SMART DETECTION ENGINE
+-- ============================================================
+
+local Detection = {}
+
+local function normalise(name)
+    return tostring(name):lower():gsub("%s+", "")
+end
+
+local function matchesKeywords(name, keywords)
+    local n = normalise(name)
+    for _, kw in ipairs(keywords) do
+        if n:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+-- Scan a container and return child values that match keywords.
+-- Returns { found = ValueObject } table.
+local function detectValuesByKeywords(container, keywords)
+    local results = {}
+    if not container then return results end
+    for _, child in ipairs(container:GetChildren()) do
+        if matchesKeywords(child.Name, keywords) then
+            if child:IsA("NumberValue") or child:IsA("IntValue") or child:IsA("StringValue") then
+                table.insert(results, child)
+            end
+        end
+    end
+    return results
+end
+
+-- Scan a container and return sub-folders that match keywords.
+local function detectFoldersByKeywords(container, keywords)
+    local results = {}
+    if not container then return results end
+    for _, child in ipairs(container:GetChildren()) do
+        if (child:IsA("Folder") or child:IsA("Model") or child:IsA("Configuration")) then
+            if matchesKeywords(child.Name, keywords) then
+                table.insert(results, child)
+            end
+        end
+    end
+    return results
+end
+
+-- Given a player, return best guesses for money value, inventory folder, shop folder.
+function Detection.scanPlayer(player)
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local playerGui   = player:FindFirstChildOfClass("PlayerGui")
+
+    local result = {
+        moneyValues     = {},
+        inventoryFolders = {},
+        shopFolders     = {},
+    }
+
+    -- Search leaderstats
+    if leaderstats then
+        -- Money
+        local mv = detectValuesByKeywords(leaderstats, CFG.MONEY_KEYWORDS)
+        for _, v in ipairs(mv) do table.insert(result.moneyValues, v) end
+
+        -- Inventory & shop sub-folders
+        local inv = detectFoldersByKeywords(leaderstats, CFG.INVENTORY_KEYWORDS)
+        for _, f in ipairs(inv) do table.insert(result.inventoryFolders, f) end
+
+        local sh = detectFoldersByKeywords(leaderstats, CFG.SHOP_KEYWORDS)
+        for _, f in ipairs(sh) do table.insert(result.shopFolders, f) end
+    end
+
+    -- Search directly under player
+    local inv2 = detectFoldersByKeywords(player, CFG.INVENTORY_KEYWORDS)
+    for _, f in ipairs(inv2) do table.insert(result.inventoryFolders, f) end
+
+    local sh2 = detectFoldersByKeywords(player, CFG.SHOP_KEYWORDS)
+    for _, f in ipairs(sh2) do table.insert(result.shopFolders, f) end
+
+    -- Fallback: scan ALL IntValue/NumberValue children of leaderstats
+    -- and try to detect remaining unknowns
+    if #result.moneyValues == 0 and leaderstats then
+        for _, child in ipairs(leaderstats:GetChildren()) do
+            if child:IsA("NumberValue") or child:IsA("IntValue") then
+                table.insert(result.moneyValues, child)
+            end
+        end
+    end
+
+    return result
+end
+
+-- ============================================================
+-- SECTION 4 — CONFIG PERSISTENCE  (executor writefile/readfile)
+-- ============================================================
+
+local ConfigStore = {}
+local loadedConfig = nil
+
+local function defaultConfig()
+    return {
+        placeId          = game.PlaceId,
+        moneyKeywords    = CFG.MONEY_KEYWORDS,
+        inventoryFolders = CFG.INVENTORY_KEYWORDS,
+        shopFolders      = CFG.SHOP_KEYWORDS,
+        savedAt          = getTimestamp(),
+    }
+end
+
+-- Simple JSON serialiser (no external deps)
+local function toSimpleJSON(tbl, indent)
+    indent = indent or ""
+    local inner = indent .. "  "
+    local parts = {}
+    local isArray = (#tbl > 0)
+
+    if isArray then
+        for _, v in ipairs(tbl) do
+            local vt = type(v)
+            if vt == "string" then
+                table.insert(parts, inner .. '"' .. jsonEscape(v) .. '"')
+            elseif vt == "number" then
+                table.insert(parts, inner .. tostring(v))
+            elseif vt == "boolean" then
+                table.insert(parts, inner .. tostring(v))
+            elseif vt == "table" then
+                table.insert(parts, toSimpleJSON(v, inner))
+            end
+        end
+        return "[\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "]"
+    else
+        for k, v in pairs(tbl) do
+            local vt = type(v)
+            local key = '"' .. tostring(k) .. '"'
+            if vt == "string" then
+                table.insert(parts, inner .. key .. ': "' .. jsonEscape(v) .. '"')
+            elseif vt == "number" then
+                table.insert(parts, inner .. key .. ': ' .. tostring(v))
+            elseif vt == "boolean" then
+                table.insert(parts, inner .. key .. ': ' .. tostring(v))
+            elseif vt == "table" then
+                table.insert(parts, inner .. key .. ': ' .. toSimpleJSON(v, inner))
+            end
+        end
+        return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
+    end
+end
+
+function ConfigStore.load()
+    if not readfile then
+        warn("[Telemetry] readfile not available; using defaults.")
+        loadedConfig = defaultConfig()
+        return loadedConfig
+    end
+
+    local ok, data = pcall(readfile, CFG.CONFIG_FILE)
+    if ok and data and data ~= "" then
+        local decodeOk, decoded = pcall(function()
+            -- Use executor's JSON decode if available
+            if game:GetService("HttpService").JSONDecode then
+                return game:GetService("HttpService"):JSONDecode(data)
+            end
+        end)
+        if decodeOk and decoded then
+            loadedConfig = decoded
+            print("[Telemetry] Config loaded from file for PlaceId", game.PlaceId)
+            return loadedConfig
+        end
+    end
+
+    -- No file or decode failed — create default
+    loadedConfig = defaultConfig()
+    ConfigStore.save(loadedConfig)
+    return loadedConfig
+end
+
+function ConfigStore.save(cfg)
+    if not writefile then
+        warn("[Telemetry] writefile not available; config not persisted.")
+        return
+    end
+    cfg.savedAt = getTimestamp()
+    local ok, err = pcall(writefile, CFG.CONFIG_FILE, toSimpleJSON(cfg))
+    if ok then
+        print("[Telemetry] Config saved:", CFG.CONFIG_FILE)
+    else
+        warn("[Telemetry] Config save failed:", err)
+    end
+end
+
+function ConfigStore.get()
+    return loadedConfig or ConfigStore.load()
+end
+
+-- ============================================================
+-- SECTION 5 — PLAYER TRACKING
+-- ============================================================
+
+local PlayerSessions = {}  -- [userId] = session table
+
+local function newSession(player)
+    return {
+        userId      = player.UserId,
+        name        = player.Name,
+        money       = {},       -- { [valueObj] = lastValue }
+        inventory   = {},       -- { [valueObj] = lastValue }
+        shop        = {},       -- { [valueObj] = lastValue }
+        connections = {},
+        lastKeys    = {},       -- dedup
+        eventCount  = 0,
+        sessionLog  = {},
+        totalSpent  = 0,
+        purchases   = {},       -- { [itemName] = { count, totalSpent } }
+    }
+end
+
+local function isDup(session, key)
+    if session.lastKeys[key] then return true end
+    session.lastKeys[key] = true
+    -- Clear after 2 seconds to allow re-triggers
+    task.delay(2, function() session.lastKeys[key] = nil end)
+    return false
+end
+
+local function logEvent(session, category, data)
+    session.eventCount = session.eventCount + 1
+    table.insert(session.sessionLog, {
+        tick     = tick(),
+        category = category,
+        data     = data,
+    })
+    -- Keep log bounded
+    if #session.sessionLog > 500 then
+        table.remove(session.sessionLog, 1)
+    end
+end
+
+-- Build session summary text
+local function buildSummary(session)
+    local lines = {
+        string.format("<b>📊 Session Summary</b>"),
+        string.format("👤 <b>Player:</b> %s", session.name),
+        "",
+    }
+
+    if next(session.purchases) then
+        table.insert(lines, "<b>🛒 Purchases:</b>")
+        for item, rec in pairs(session.purchases) do
+            table.insert(lines, string.format(
+                "  • %s — %dx  (-%g total)",
+                item, rec.count, rec.totalSpent
+            ))
+        end
+        table.insert(lines, "")
+    end
+
+    table.insert(lines, string.format("<b>💸 Total spent:</b> %g", session.totalSpent))
+    table.insert(lines, string.format("<b>📦 Events logged:</b> %d", session.eventCount))
+    table.insert(lines, "")
+    table.insert(lines, "<i>" .. getTimestamp() .. "</i>")
+
+    return table.concat(lines, "\n")
+end
+
+-- Money change handler
+local function onMoneyChanged(session, valueObj, newVal)
+    local prevVal = session.money[valueObj] or newVal
+    local delta   = newVal - prevVal
+
+    if math.abs(delta) < CFG.MONEY_EPS then return end
+
+    local key = string.format("money_%s_%.4f_%.4f", valueObj.Name, prevVal, newVal)
+    if isDup(session, key) then return end
+
+    session.money[valueObj] = newVal
+
+    local action = delta < 0 and "💸 Money Lost / Spent" or "💰 Money Gained"
+    local sign   = delta >= 0 and "+" or ""
+
+    if delta < 0 then
+        session.totalSpent = session.totalSpent + math.abs(delta)
+    end
+
+    logEvent(session, "MONEY", { name = valueObj.Name, prev = prevVal, new = newVal, delta = delta })
+
+    local msg = table.concat({
+        string.format("<b>%s</b>", action),
+        "",
+        string.format("👤 <b>Player:</b>    %s",       session.name),
+        string.format("🏷  <b>Stat:</b>      %s",       valueObj.Name),
+        string.format("💵 <b>Previous:</b>  %g",        prevVal),
+        string.format("💵 <b>Current:</b>   %g",        newVal),
+        string.format("🔄 <b>Change:</b>    %s%g",      sign, delta),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(msg, session.userId)
+
+    task.delay(0.8, function()
+        sendTelegram(buildSummary(session), session.userId)
+    end)
+end
+
+-- Inventory / item change handler
+local function onItemChanged(session, valueObj, newVal, category)
+    local prevVal = session[category][valueObj]
+    if prevVal == nil then
+        session[category][valueObj] = newVal
+        return
+    end
+
+    local delta = newVal - prevVal
+    if delta == 0 then return end
+
+    local key = string.format("item_%s_%s_%g_%g", category, valueObj.Name, prevVal, newVal)
+    if isDup(session, key) then return end
+
+    session[category][valueObj] = newVal
+
+    local emoji, action
+    if delta > 0 then
+        emoji  = "📦"
+        action = "Gained / Received"
+    else
+        emoji  = "📤"
+        action = "Used / Lost / Removed"
+    end
+
+    logEvent(session, category:upper(), { name = valueObj.Name, prev = prevVal, new = newVal, delta = delta })
+
+    local sign = delta >= 0 and "+" or ""
+    local msg  = table.concat({
+        string.format("<b>%s Item Event</b>", emoji),
+        "",
+        string.format("👤 <b>Player:</b>    %s",  session.name),
+        string.format("📌 <b>Action:</b>    %s",  action),
+        string.format("🎒 <b>Item:</b>      %s",  valueObj.Name),
+        string.format("🔢 <b>Change:</b>    %s%g", sign, delta),
+        string.format("📊 <b>Previous:</b>  %g",  prevVal),
+        string.format("📊 <b>Current:</b>   %g",  newVal),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(msg, session.userId)
+end
+
+-- Attach a listener to a value object
+local function watchValue(session, valueObj, onChange)
+    -- Record initial
+    valueObj.Changed:Connect(function(newVal)
+        pcall(onChange, session, valueObj, newVal)
+    end)
+end
+
+-- Watch all children of a folder (current + future)
+local function watchFolder(session, folder, category)
+    if not folder then return end
+
+    local function attach(child)
+        if child:IsA("NumberValue") or child:IsA("IntValue") then
+            session[category][child] = child.Value
+            watchValue(session, child, function(s, obj, v)
+                onItemChanged(s, obj, v, category)
+            end)
+        end
+    end
+
+    for _, child in ipairs(folder:GetChildren()) do attach(child) end
+
+    local c = folder.ChildAdded:Connect(function(child)
+        task.wait(0.05)
+        attach(child)
+    end)
+    table.insert(session.connections, c)
+end
+
+-- ============================================================
+-- SECTION 6 — SHOP SYSTEM
+-- ============================================================
+
+-- A "purchase" is detected when:
+--   money goes DOWN and an inventory item goes UP in the same ~1 second window.
+-- We correlate them using a pending-purchase buffer.
+
+local PendingPurchases = {}  -- [userId] = { moneyDelta, tick }
+
+local function onShopItemChanged(session, valueObj, newVal)
+    local prevVal = session.shop[valueObj]
+    if prevVal == nil then
+        session.shop[valueObj] = newVal
+        return
+    end
+
+    local delta = newVal - prevVal
+    if delta <= 0 then
+        session.shop[valueObj] = newVal
+        return  -- Only care about quantity increases (buying)
+    end
+
+    local key = string.format("shop_%s_%g_%g", valueObj.Name, prevVal, newVal)
+    if isDup(session, key) then return end
+
+    session.shop[valueObj] = newVal
+
+    -- Check if there's a pending money deduction
+    local pending = PendingPurchases[session.userId]
+    local cost    = 0
+    if pending and (tick() - pending.t) < 1.5 then
+        cost = math.abs(pending.delta)
+        PendingPurchases[session.userId] = nil
+    end
+
+    -- Record in purchases table
+    local rec = session.purchases[valueObj.Name]
+    if not rec then
+        rec = { count = 0, totalSpent = 0 }
+        session.purchases[valueObj.Name] = rec
+    end
+    rec.count      = rec.count + delta
+    rec.totalSpent = rec.totalSpent + cost
+
+    logEvent(session, "SHOP", {
+        item  = valueObj.Name,
+        qty   = delta,
+        cost  = cost,
+        prev  = prevVal,
+        new   = newVal,
+    })
+
+    local sign = delta >= 0 and "+" or ""
+    local msg  = table.concat({
+        "<b>🛒 Shop Purchase Detected</b>",
+        "",
+        string.format("👤 <b>Player:</b>    %s",  session.name),
+        string.format("🎒 <b>Item:</b>      %s",  valueObj.Name),
+        string.format("🔢 <b>Qty:</b>       %s%d", sign, delta),
+        string.format("💸 <b>Cost:</b>      -%g",  cost),
+        string.format("📊 <b>Previous:</b>  %g",   prevVal),
+        string.format("📊 <b>Current:</b>   %g",   newVal),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(msg, session.userId)
+
+    task.delay(0.6, function()
+        sendTelegram(buildSummary(session), session.userId)
+    end)
+end
+
+-- ============================================================
+-- SECTION 7 — GUI SYSTEM
+-- ============================================================
+
+local GUI = {}
+local guiRefs = {}
+
+local function removeOldGui()
+    local lp = game:GetService("Players").LocalPlayer
+    local pg = lp:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        local old = pg:FindFirstChild("TelemetryHUD")
+        if old then old:Destroy() end
+    end
+end
+
+local function makeLabel(parent, name, size, pos, text, color, fontSize, bold)
+    local lbl = Instance.new("TextLabel")
+    lbl.Name            = name
+    lbl.Parent          = parent
+    lbl.Size            = size
+    lbl.Position        = pos
+    lbl.BackgroundTransparency = 1
+    lbl.Text            = text
+    lbl.TextColor3      = color or CFG.GUI_TEXT_COLOR
+    lbl.TextSize        = fontSize or 13
+    lbl.Font            = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    lbl.TextXAlignment  = Enum.TextXAlignment.Left
+    lbl.TextTruncate    = Enum.TextTruncate.AtEnd
+    return lbl
+end
+
+function GUI.build()
+    removeOldGui()
+
+    local lp = game:GetService("Players").LocalPlayer
+    local pg = lp:WaitForChild("PlayerGui", 10)
+    if not pg then return end
+
+    -- Screen GUI
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name            = "TelemetryHUD"
+    screenGui.ResetOnSpawn    = false
+    screenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+    screenGui.IgnoreGuiInset  = true
+    screenGui.Parent          = pg
+
+    -- Main frame
+    local frame = Instance.new("Frame")
+    frame.Name              = "MainFrame"
+    frame.Size              = UDim2.new(0, 270, 0, 190)
+    frame.Position          = UDim2.new(1, -285, 0, 15)
+    frame.BackgroundColor3  = CFG.GUI_BG_COLOR
+    frame.BorderSizePixel   = 0
+    frame.Parent            = screenGui
+
+    -- Rounded corners
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent       = frame
+
+    -- Accent bar top
+    local bar = Instance.new("Frame")
+    bar.Size             = UDim2.new(1, 0, 0, 4)
+    bar.Position         = UDim2.new(0, 0, 0, 0)
+    bar.BackgroundColor3 = CFG.GUI_ACCENT_COLOR
+    bar.BorderSizePixel  = 0
+    bar.Parent           = frame
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 4)
+
+    -- Title
+    makeLabel(frame, "Title",
+        UDim2.new(1, -10, 0, 20),
+        UDim2.new(0, 10, 0, 8),
+        "⬛ TELEMETRY SYSTEM",
+        CFG.GUI_ACCENT_COLOR, 12, true
+    )
+
+    -- Status dot + text
+    local statusDot = Instance.new("Frame")
+    statusDot.Name             = "StatusDot"
+    statusDot.Size             = UDim2.new(0, 8, 0, 8)
+    statusDot.Position         = UDim2.new(0, 10, 0, 35)
+    statusDot.BackgroundColor3 = CFG.GUI_ACCENT_COLOR
+    statusDot.BorderSizePixel  = 0
+    statusDot.Parent           = frame
+    Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+
+    makeLabel(frame, "StatusText",
+        UDim2.new(1, -30, 0, 16),
+        UDim2.new(0, 25, 0, 29),
+        "● ACTIVE — Watching events",
+        CFG.GUI_ACCENT_COLOR, 12, true
+    )
+
+    -- Divider
+    local div = Instance.new("Frame")
+    div.Size             = UDim2.new(1, -20, 0, 1)
+    div.Position         = UDim2.new(0, 10, 0, 52)
+    div.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    div.BorderSizePixel  = 0
+    div.Parent           = frame
+
+    -- Info rows
+    local rows = {
+        { name = "RowPlayer",  y = 60,  label = "Player:",     key = "player"  },
+        { name = "RowBalance", y = 78,  label = "Balance:",    key = "balance" },
+        { name = "RowEvents",  y = 96,  label = "Events:",     key = "events"  },
+        { name = "RowQueue",   y = 114, label = "Queue:",      key = "queue"   },
+        { name = "RowGame",    y = 132, label = "Game ID:",    key = "game"    },
+    }
+
+    for _, r in ipairs(rows) do
+        makeLabel(frame, r.name .. "Lbl",
+            UDim2.new(0, 80, 0, 16),
+            UDim2.new(0, 12, 0, r.y),
+            r.label,
+            Color3.fromRGB(130, 130, 150), 12
+        )
+        guiRefs[r.key] = makeLabel(frame, r.name .. "Val",
+            UDim2.new(0, 160, 0, 16),
+            UDim2.new(0, 90, 0, r.y),
+            "—", CFG.GUI_TEXT_COLOR, 12
+        )
+    end
+
+    -- Last event bar
+    local div2 = Instance.new("Frame")
+    div2.Size             = UDim2.new(1, -20, 0, 1)
+    div2.Position         = UDim2.new(0, 10, 0, 155)
+    div2.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    div2.BorderSizePixel  = 0
+    div2.Parent           = frame
+
+    guiRefs.lastEvent = makeLabel(frame, "LastEvent",
+        UDim2.new(1, -14, 0, 16),
+        UDim2.new(0, 10, 0, 160),
+        "Last: —",
+        Color3.fromRGB(110, 110, 130), 11
+    )
+
+    -- Close button
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Name               = "Close"
+    closeBtn.Size               = UDim2.new(0, 22, 0, 22)
+    closeBtn.Position           = UDim2.new(1, -26, 0, 6)
+    closeBtn.BackgroundColor3   = Color3.fromRGB(60, 20, 20)
+    closeBtn.TextColor3         = Color3.fromRGB(255, 80, 80)
+    closeBtn.Text               = "✕"
+    closeBtn.Font               = Enum.Font.GothamBold
+    closeBtn.TextSize           = 12
+    closeBtn.BorderSizePixel    = 0
+    closeBtn.Parent             = frame
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        screenGui:Destroy()
+    end)
+
+    -- Make frame draggable
+    local dragging, dragStart, startPos
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = frame.Position
+        end
+    end)
+    frame.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+    game:GetService("UserInputService").InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    guiRefs.frame      = frame
+    guiRefs.screenGui  = screenGui
+    guiRefs.statusDot  = statusDot
+    guiRefs.statusText = frame:FindFirstChild("StatusText")
+
+    return screenGui
+end
+
+function GUI.update(data)
+    if not guiRefs.frame then return end
+    pcall(function()
+        if data.player  then guiRefs.player.Text  = data.player  end
+        if data.balance then guiRefs.balance.Text = data.balance end
+        if data.events  then guiRefs.events.Text  = tostring(data.events)  end
+        if data.queue   then guiRefs.queue.Text   = tostring(data.queue)   end
+        if data.game    then guiRefs.game.Text    = data.game   end
+        if data.lastEvent then
+            guiRefs.lastEvent.Text = "Last: " .. data.lastEvent
+        end
+    end)
+end
+
+function GUI.setStatus(ok, msg)
+    pcall(function()
+        local color = ok and CFG.GUI_ACCENT_COLOR or CFG.GUI_ERROR_COLOR
+        guiRefs.statusDot.BackgroundColor3 = color
+        if guiRefs.statusText then
+            guiRefs.statusText.TextColor3 = color
+            guiRefs.statusText.Text       = (ok and "● ACTIVE — " or "⚠ ERROR — ") .. msg
+        end
+    end)
+end
+
+-- ============================================================
+-- SECTION 8 — MAIN INIT
+-- ============================================================
+
+-- Clean up any previous execution
+if _G.__TelemetrySystem then
+    pcall(function()
+        _G.__TelemetrySystem.cleanup()
+    end)
+end
+
+-- Load / create config
+local config = ConfigStore.load()
+
+-- Build GUI
+GUI.build()
+GUI.update({
+    game    = tostring(game.PlaceId),
+    player  = "—",
+    balance = "—",
+    events  = 0,
+    queue   = 0,
+})
+
+local Players         = game:GetService("Players")
+local localPlayer     = Players.LocalPlayer
+local RunService      = game:GetService("RunService")
+
+-- Setup for local player
+local function setupLocalPlayer(player)
+    local session = newSession(player)
+    PlayerSessions[player.UserId] = session
+
+    -- Wait for leaderstats
+    local leaderstats = player:WaitForChild("leaderstats", 20)
+    if not leaderstats then
+        GUI.setStatus(false, "leaderstats not found")
+        warn("[Telemetry] leaderstats not found for", player.Name)
+        return
+    end
+
+    -- Run smart detection
+    local detected = Detection.scanPlayer(player)
+
+    -- Track first money value for GUI display
+    local primaryMoney = nil
+
+    -- Attach money watchers
+    for _, mv in ipairs(detected.moneyValues) do
+        session.money[mv] = mv.Value
+        if not primaryMoney then primaryMoney = mv end
+
+        local conn = mv.Changed:Connect(function(newVal)
+            -- Tag pending purchase for shop correlation
+            local prev  = session.money[mv] or newVal
+            local delta = newVal - prev
+            if delta < 0 then
+                PendingPurchases[session.userId] = { delta = delta, t = tick() }
+            end
+            pcall(onMoneyChanged, session, mv, newVal)
+        end)
+        table.insert(session.connections, conn)
+    end
+
+    -- Attach inventory watchers
+    for _, folder in ipairs(detected.inventoryFolders) do
+        watchFolder(session, folder, "inventory")
+    end
+
+    -- Attach shop watchers
+    for _, folder in ipairs(detected.shopFolders) do
+        local function attachShopItem(child)
+            if child:IsA("NumberValue") or child:IsA("IntValue") then
+                session.shop[child] = child.Value
+                local conn = child.Changed:Connect(function(newVal)
+                    pcall(onShopItemChanged, session, child, newVal)
+                end)
+                table.insert(session.connections, conn)
+            end
+        end
+        for _, child in ipairs(folder:GetChildren()) do attachShopItem(child) end
+        local c = folder.ChildAdded:Connect(function(child)
+            task.wait(0.05)
+            attachShopItem(child)
+        end)
+        table.insert(session.connections, c)
+    end
+
+    -- Also watch leaderstats directly for new children (dynamic stats)
+    local lsConn = leaderstats.ChildAdded:Connect(function(child)
+        task.wait(0.1)
+        if child:IsA("NumberValue") or child:IsA("IntValue") then
+            if matchesKeywords(child.Name, CFG.MONEY_KEYWORDS) then
+                session.money[child] = child.Value
+                if not primaryMoney then primaryMoney = child end
+                child.Changed:Connect(function(v)
+                    pcall(onMoneyChanged, session, child, v)
+                end)
+            end
+        end
+    end)
+    table.insert(session.connections, lsConn)
+
+    -- Send join notification
+    local detectedNames = {}
+    for _, mv in ipairs(detected.moneyValues) do
+        table.insert(detectedNames, mv.Name .. "=" .. tostring(mv.Value))
+    end
+
+    local joinMsg = table.concat({
+        "<b>🟢 Player Session Started</b>",
+        "",
+        string.format("👤 <b>Player:</b>     %s",  player.Name),
+        string.format("🎮 <b>Game:</b>       %s",  game.Name ~= "" and game.Name or tostring(game.PlaceId)),
+        string.format("💵 <b>Detected:</b>   %s",  #detectedNames > 0 and table.concat(detectedNames, " | ") or "none"),
+        string.format("📦 <b>Inv folders:</b> %d",  #detected.inventoryFolders),
+        string.format("🛒 <b>Shop folders:</b> %d", #detected.shopFolders),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+    sendTelegram(joinMsg, player.UserId)
+
+    GUI.setStatus(true, "Watching " .. player.Name)
+    GUI.update({
+        player  = player.Name,
+        balance = primaryMoney and tostring(primaryMoney.Value) or "—",
+        events  = 0,
+    })
+
+    -- Save detected config
+    config.detectedMoney    = detectedNames
+    config.invFolderCount   = #detected.inventoryFolders
+    config.shopFolderCount  = #detected.shopFolders
+    ConfigStore.save(config)
+
+    -- Heartbeat: update GUI every 2 seconds
+    local guiConn = RunService.Heartbeat:Connect(function()
+        local balance = primaryMoney and tostring(primaryMoney.Value) or "—"
+        GUI.update({
+            balance = balance,
+            events  = session.eventCount,
+            queue   = #TelegramQueue,
+        })
+        if session.sessionLog[#session.sessionLog] then
+            local last = session.sessionLog[#session.sessionLog]
+            GUI.update({ lastEvent = last.category .. ": " .. tostring(last.data.name or "") })
+        end
+    end)
+    table.insert(session.connections, guiConn)
+end
+
+-- Cleanup
+local function cleanupPlayer(player)
+    local session = PlayerSessions[player.UserId]
+    if not session then return end
+
+    for _, c in ipairs(session.connections) do
+        pcall(function() c:Disconnect() end)
+    end
+
+    local leaveMsg = table.concat({
+        "<b>🔴 Player Session Ended</b>",
+        "",
+        string.format("👤 <b>Player:</b>  %s",  session.name),
+        string.format("📦 <b>Events:</b>  %d",  session.eventCount),
+        string.format("💸 <b>Spent:</b>   %g",  session.totalSpent),
+        "",
+        "<i>" .. getTimestamp() .. "</i>",
+    }, "\n")
+
+    sendTelegram(leaveMsg, player.UserId)
+    sendTelegram(buildSummary(session), player.UserId)
+
+    PlayerSessions[player.UserId] = nil
+end
+
+-- Global handle for re-execute cleanup
+_G.__TelemetrySystem = {
+    cleanup = function()
+        for uid, session in pairs(PlayerSessions) do
+            for _, c in ipairs(session.connections) do
+                pcall(function() c:Disconnect() end)
+            end
+        end
+        PlayerSessions = {}
+        removeOldGui()
+    end
+}
+
+-- Start
+task.spawn(setupLocalPlayer, localPlayer)
+
+game:GetService("Players").PlayerRemoving:Connect(function(player)
+    if player == localPlayer then
+        cleanupPlayer(player)
+    end
+end)
+
+print(string.format(
+    "[Telemetry] Loaded for %s | PlaceId: %s | Config: %s",
+    localPlayer.Name, tostring(game.PlaceId), CFG.CONFIG_FILE
+))
