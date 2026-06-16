@@ -47,7 +47,7 @@ local PG = LP:WaitForChild("PlayerGui", 15)
 --        getgenv().TSys_CONFIG.BATCH_SEC = 10
 -- ═══════════════════════════════════════════════════════════════════════════
 local CFG = {
-    BOT_TOKEN   = "8686310272:AAHjuFeQN8mVxb9EW-r2jZ7PoN4cqQ90XhU",
+    BOT_TOKEN   = "8883035455:AAHQ2oWEWr8ILY8U_4_cvdy47gs3QjJX_j8",
     CHAT_ID     = "6997943273",
     MAX_RETRIES = 3,
     RETRY_WAIT  = 3,      -- seconds between retry attempts
